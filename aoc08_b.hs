@@ -1,0 +1,93 @@
+{-# OPTIONS_GHC -Wall #-}
+{-# LANGUAGE LambdaCase      #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns    #-}
+-- vector
+import           Control.Monad
+import           Control.Monad.ST
+import           Data.Function
+import           Data.Functor
+import           Data.Maybe
+import           Data.Monoid
+import           Data.Ord
+import qualified Data.Vector.Algorithms.Heap as Heapsort
+import qualified Data.Vector.Strict          as V
+import qualified Data.Vector.Unboxed         as U
+import qualified Data.Vector.Unboxed.Mutable as W
+type Coord = Int
+type Index = Int
+type Cardi = Int -- Please excuse the funny name.
+data P = P {-# UNPACK #-} !Coord {-# UNPACK #-} !Coord {-# UNPACK #-} !Coord
+getX :: P -> Coord
+getX (P x _ _) = x
+sqdist :: P -> P -> Coord
+sqdist (P x1 y1 z1) (P x2 y2 z2) = sq dx + sq dy + sq dz where
+  dx = x1 - x2; dy = y1 - y2; dz = z1 - z2; sq n = n * n
+-- Basic disjoint set data structure with path compression and union by count.
+type Disj s = U.MVector s Node
+-- Allow using an unboxed vector to minimize both memory and indirections,
+-- not to mention lessening the stress on the garbage collector.
+type Node = Int
+tellsgn :: (Num a, Ord a) => a -> Either a a -- left for negative (abs val), right for non-negative.
+tellsgn n | n < 0 = Left (negate n) | otherwise = Right n
+pattern Root :: Cardi -> Node -- Since size is always positive, we can negate it to mark roots.
+pattern Root c <- (tellsgn -> Left c) where Root c = negate c
+pattern Link :: Index -> Node -- Indices are always non-negative.
+pattern Link p <- (tellsgn -> Right p) where Link p = p
+{-# COMPLETE Root, Link #-}
+{-# INLINE tellsgn #-}
+{-# INLINE Root #-}
+{-# INLINE Link #-}
+djInit :: Cardi -> ST s (Disj s)
+djInit = (`W.replicate` Root 1)
+djFind :: Disj s -> Index -> ST s Index
+djFind dj i = W.read dj i >>= \case
+  -- Simple path compression, instead of the complex ones that do halving or splitting.
+  Root _ -> pure i
+  Link p -> do r <- djFind dj p; r <$ W.write dj i (Link r)
+-- Returns True if union was performed, False if already in same set.
+djUnion :: Disj s -> Index -> Index -> ST s Bool
+djUnion dj i j = do
+  ri <- djFind dj i; rj <- djFind dj j
+  if ri /= rj
+  then True <$ do
+    let w = W.write dj
+    xi <- W.read dj ri; xj <- W.read dj rj
+    case (xi, xj) of
+      (Root ci, Root cj)
+        | ci < cj   -> w ri (Link rj) >> w rj (Root (ci + cj))
+        | otherwise -> w rj (Link ri) >> w ri (Root (cj + ci))
+      _ -> error "djUnion: djFind returned a non-root node"
+  else pure False
+-- Aggregate points into clusters by proximity between the points, but use
+-- a clustering count to limit the number of unions performed.
+--   At some point, all points will be in a single cluster. Find the
+-- product of the x-cooridnates of both points when the last union is performed.
+solve :: [P] -> Integer
+solve = entry where
+  entry (V.fromList -> ps) = runST $ do
+    let vs = V.map (uncurry ((,) `on` fst)) $
+             V.modify (Heapsort.sortBy distcmp) $
+             do (i, p) <- qs; (j, q) <- qs; ((i, p), (j, q)) <$ guard (i < j)
+        qs = V.indexed ps
+        x  = toInteger . getX . (ps V.!)
+    dj <- djInit (length ps)
+    V.foldMap' (unite dj) vs <&>
+      uncurry ((*) `on` x) .
+      fromMaybe (error "solve: no unions performed") .
+      getLast
+  distcmp ((i, p), (j, q)) ((k, r), (l, s)) =
+    comparing (uncurry sqdist) (p, q) (r, s) <>
+    compare i k <> compare j l -- tie-breakers
+  unite dj (i, j) =
+    djUnion dj i j >>= \case
+    True  -> pure $ Last $ Just (i, j)
+    False -> mempty
+main :: IO ()
+main = interact $ show . solve . map readP . lines where
+  readP s
+    | [x, y, z] <- map read $ split s = P x y z
+    | otherwise = error "bad point"
+  split str = case break (== ',') str of
+    (tok, "")       -> [tok]
+    (tok, _ : rest) ->  tok : split rest
